@@ -1,0 +1,3 @@
+streamlit       # framework web app
+google-genai    # SDK untuk memanggil Gemini
+pandas          # pengolahan data tabel
