@@ -3,9 +3,9 @@ import os, re, glob, zipfile
 import pandas as pd
 import matplotlib.pyplot as plt
 from sqlalchemy import create_engine, text
-# import gdown # gdown is not directly used in the Streamlit app assuming data is staged
+import gdown # Used for downloading data if not present
 import google.generativeai as genai
-import json # Required for generate_sql
+import json # Used in generate_sql, although current notebook implementation uses resp.text
 
 # === Global Constants from Notebook ===
 SCHEMA_STR = """customers(cust_id, nama, tarif, wilayah)
@@ -25,58 +25,60 @@ _FUNGSI_FROM = r'\b(?:extract|substring|trim|position|overlay)\s*\([^)]*\)'
 TABEL_OK = {'customers','usage'}
 TEAL = '#0E8388'
 
-# --- LLM Setup (adapted from notebook) ---
-PROVIDER = 'mock' # Default to mock
-GEMINI_MODEL = 'gemini-2.5-flash'
+# --- LLM Setup Configuration ---
+# In Streamlit, it's best practice to get API keys from st.secrets or environment variables.
+PROVIDER = 'mock' # Default to mock if no API key is found
+GEMINI_MODEL = 'gemini-1.5-flash' # Using the original model name from notebook's TODO 1
 
-# In a real Streamlit deployment, API key should be from st.secrets or env vars
-if os.environ.get('GOOGLE_API_KEY'):
+# Try to get GOOGLE_API_KEY from st.secrets first for Streamlit Cloud deployment
+if st.secrets.get('GOOGLE_API_KEY'):
     PROVIDER = 'gemini'
-# Add other providers like OpenAI/Groq here if needed
+
 USE_MOCK = (PROVIDER == 'mock')
 
 # --- Functions (adapted from notebook) ---
 
 @st.cache_resource
-def setup_database():
+def setup_database(db_url):
     """
     Sets up the PostgreSQL engine and loads data. This function is cached
     to avoid re-running on every Streamlit rerun.
-    Assumes a PostgreSQL server is running and accessible.
     """
     st.info("Initializing database connection and loading data...")
     try:
-        # Connect to an assumed-running PostgreSQL instance
-        # In a real deployment, ensure PostgreSQL is provisioned and running.
-        engine = create_engine("postgresql+psycopg2://postgres:postgres@localhost:5432/miniproject")
+        engine = create_engine(db_url)
         with engine.connect() as conn:
-            # A simple check for database existence, or attempt to create if not exists (might need privileges)
-            # For a basic setup, we assume 'miniproject' database exists.
-            # For robust production, database creation/migration is handled separately.
             conn.execute(text("SELECT 1")) # Test connection
-            st.success(f"PostgreSQL connected.")
+            st.success(f"PostgreSQL connected to {db_url.split('@')[-1]}")
 
-        # Load CSVs into the database
         CSV_FILES = ['customers.csv', 'usage.csv']
-        data_dir = "data" # Assumes 'data' directory is relative to app.py
+        data_dir = "data"
         os.makedirs(data_dir, exist_ok=True)
+
+        # Assuming the ZIP download was already handled in the Colab setup
+        # If running this Streamlit app independently, you might need to
+        # re-implement the gdown logic or ensure files are pre-staged.
+        # For this example, we assume data/customers.csv and data/usage.csv exist.
+        
+        # Check if files exist, if not, attempt to download with default IDs
+        # These default IDs are from the initial notebook setup for Use Case B
+        if not os.path.exists(os.path.join(data_dir, "dataset.zip")):
+            DRIVE_ZIP_URL = "https://drive.google.com/uc?id=1KozrOgW1ChAKK2zHM1o-r_BPt08-zKR2"
+            try:
+                gdown.download(DRIVE_ZIP_URL, os.path.join(data_dir, "dataset.zip"), quiet=True)
+                with zipfile.ZipFile(os.path.join(data_dir, "dataset.zip")) as z:
+                    z.extractall(data_dir)
+                st.info("Dataset ZIP downloaded and extracted.")
+            except Exception as dl_e:
+                st.warning(f"Could not download dataset ZIP: {dl_e}. Assuming CSVs exist or will be manually placed.")
 
         for fn in CSV_FILES:
             table = fn[:-4]
             filepath = os.path.join(data_dir, fn)
 
             if not os.path.exists(filepath):
-                st.warning(f"File {filepath} not found locally. Attempting to download.")
-                # Fallback to gdown if files are not present in 'data' dir
-                # This requires gdown to be imported and URL to be known/passed
-                if fn == 'customers.csv':
-                    gdown.download("https://drive.google.com/uc?id=1sFp_4kpw_mC-JR1ruieQO24UxsIFeRj3", filepath, quiet=True)
-                elif fn == 'usage.csv':
-                    gdown.download("https://drive.google.com/uc?id=19rVcaTTnO-YbGEd5uRxObRY2w-cCYQAG", filepath, quiet=True)
-                
-                if not os.path.exists(filepath):
-                    st.error(f"Failed to find or download {fn}. Please ensure data files are available.")
-                    continue
+                 st.error(f"File {filepath} not found. Please ensure data files are available in the 'data' directory.")
+                 continue # Skip this table if file not found
 
             df = pd.read_csv(filepath)
             df.to_sql(table, engine, if_exists="replace", index=False)
@@ -84,7 +86,7 @@ def setup_database():
 
         return engine
     except Exception as e:
-        st.error(f"Failed to setup database: {e}. Please ensure PostgreSQL is running and accessible.")
+        st.error(f"Failed to setup database: {e}. Please ensure PostgreSQL is running and accessible and DB_URL is correct.")
         return None
 
 def build_prompt(question: str) -> str:
@@ -95,8 +97,11 @@ def build_prompt(question: str) -> str:
               """
     return prompt
 
-def generate_sql(resp_text: str) -> str:
-    teks = resp_text.strip()
+def generate_sql(resp):
+    # This function expects a string (resp.text from LLM) or a dict (for mock)
+    if isinstance(resp, dict): # For mock responses that might pass a dict
+        resp = resp.get('sql', json.dumps(resp))
+    teks = str(resp).strip()
     m = re.search(r'```(?:sql)?\s*(.+?)```', teks, re.S)
     if m: teks = m.group(1).strip()
     m = re.search(r'(select\b.+)', teks, re.I | re.S)
@@ -131,55 +136,80 @@ def run_sql(sql: str, engine_obj) -> pd.DataFrame:
         return pd.read_sql(text(sql), conn)
 
 def visualize(df, pertanyaan='', jenis=None):
-    jenis = 'bar'
-    if not isinstance(df, pd.DataFrame): return None
-    if pertanyaan:
-        p, x = pertanyaan.lower(), str(df.columns[0]).lower()
-        if 'pie' in p or 'komposisi' in p or 'proporsi' in p: jenis = 'pie'
-        if 'periode' in x or 'bulan' in p or 'tren' in p: jenis = 'line'
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None # No data to visualize
 
-    if len(df.columns) < 2: return None # Need at least 2 columns for chart
+    # Determine chart type based on columns and question
+    if len(df.columns) < 2:
+        return None # Need at least 2 columns for meaningful chart
 
-    x, y = df.columns[0], df.columns[-1]
+    x_col = df.columns[0]
+    y_col = df.columns[-1]
+
+    # Try to infer type if not explicitly given
+    if jenis is None:
+        p = pertanyaan.lower()
+        x_col_lower = str(x_col).lower()
+
+        if 'pie' in p or 'komposisi' in p or 'proporsi' in p:
+            jenis = 'pie'
+        elif 'periode' in x_col_lower or 'bulan' in p or 'tren' in p:
+            jenis = 'line'
+        else:
+            jenis = 'bar'
+
     fig, ax = plt.subplots(figsize=(7, 4))
-    if jenis == 'line':
-        ax.plot(df[x].astype(str), df[y], marker='o', color=TEAL)
-        ax.set_ylabel(str(y)); plt.xticks(rotation=30, ha='right')
-    elif jenis == 'pie':
-        if df[y].sum() == 0: return None # Avoid division by zero
-        ax.pie(df[y], labels=df[x].astype(str), autopct='%1.0f%%',
-               colors=plt.cm.Greens([0.4,0.55,0.7,0.85,0.6,0.45]))
-    else:
-        ax.bar(df[x].astype(str), df[y], color=TEAL)
-        ax.set_ylabel(str(y)); plt.xticks(rotation=30, ha='right')
-    ax.set_title(pertanyaan or f'{y} per {x}')
-    plt.tight_layout()
-    return fig # Return figure object for Streamlit
+    try:
+        if jenis == 'line':
+            ax.plot(df[x_col].astype(str), df[y_col], marker='o', color=TEAL)
+            ax.set_ylabel(str(y_col))
+            plt.xticks(rotation=30, ha='right')
+        elif jenis == 'pie':
+            if df[y_col].sum() == 0:
+                return None # Avoid division by zero
+            ax.pie(df[y_col], labels=df[x_col].astype(str), autopct='%1.0f%%',
+                   colors=plt.cm.Greens([0.4,0.55,0.7,0.85,0.6,0.45]))
+        else: # Default to bar chart
+            ax.bar(df[x_col].astype(str), df[y_col], color=TEAL)
+            ax.set_ylabel(str(y_col))
+            plt.xticks(rotation=30, ha='right')
+        ax.set_title(pertanyaan or f'{y_col} per {x_col}')
+        plt.tight_layout()
+        return fig
+    except Exception as e:
+        st.warning(f"Could not generate visualization: {e}")
+        plt.close(fig) # Close figure if an error occurs to prevent memory leak
+        return None
 
-# --- Streamlit App ---f
+# --- Streamlit App ---
 st.set_page_config(layout="wide")
-st.title("⚡️ Conversational Analytics (Text-to-SQL)")
+st.title("⚡️ ASYIK - Asisten Yang kamu Inginkan")
 
 # Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Get DB_URL from st.secrets
+DB_URL = st.secrets.get('DB_URL', 'postgresql://postgres:postgres@localhost:5432/miniproject')
+if not DB_URL:
+    st.error("DB_URL not found in Streamlit secrets or environment variables. Please provide your PostgreSQL connection string.")
+    st.stop()
+
 # Setup database (cached function)
 if "db_engine" not in st.session_state:
-    st.session_state.db_engine = setup_database()
+    st.session_state.db_engine = setup_database(DB_URL)
     if st.session_state.db_engine is None:
-        st.error("Database setup failed. Please check the console for errors.")
+        st.error("Database setup failed. Please check the console for errors and ensure DB_URL is correct.")
         st.stop() # Stop the app if DB setup fails
 
 # Initialize LLM model
-llm_model = None
 if "llm_model" not in st.session_state:
     if USE_MOCK:
         st.session_state.llm_model = "mock" # Simple string for mock model
     elif PROVIDER == 'gemini':
-        gemini_api_key = os.environ.get('GOOGLE_API_KEY')
+        gemini_api_key = st.secrets.get('GOOGLE_API_KEY')
         if not gemini_api_key:
-            st.error("Google API Key (GOOGLE_API_KEY) not found in environment variables. Please set it.")
+            st.error("Google API Key (GOOGLE_API_KEY) not found in Streamlit secrets or environment variables. Please set it.")
             st.stop()
         try:
             genai.configure(api_key=gemini_api_key)
@@ -208,9 +238,7 @@ for message in st.session_state.messages:
 
 # React to user input
 if prompt := st.chat_input("Ada pertanyaan lain?"):
-    # Display user message in chat message container
     st.chat_message("user").markdown(prompt)
-    # Add user message to chat history
     st.session_state.messages.append({"role": "user", "type": "text", "content": prompt})
 
     with st.chat_message("assistant"):
@@ -220,15 +248,13 @@ if prompt := st.chat_input("Ada pertanyaan lain?"):
         sql_generated = ""
         df_result = pd.DataFrame()
         plot_fig = None
-        
+
         try:
-            # 1) Generate SQL (with retry logic)
             attempts = 0
             while attempts < 2:
                 try:
                     llm_prompt = build_prompt(prompt)
                     if USE_MOCK:
-                        # Mock responses for specific questions
                         if "total konsumsi kWh per wilayah pada bulan Januari (2026-01)" in prompt:
                             sql_generated = "SELECT c.wilayah, SUM(u.kwh) AS total_kwh FROM customers c JOIN usage u ON c.cust_id = u.cust_id WHERE u.bulan = '2026-01' GROUP BY c.wilayah ORDER BY total_kwh DESC"
                         elif "10 pelanggan dengan total tunggakan tertinggi" in prompt:
@@ -240,22 +266,21 @@ if prompt := st.chat_input("Ada pertanyaan lain?"):
                     else:
                         resp = llm_model.generate_content(llm_prompt)
                         sql_generated = generate_sql(resp.text)
-                    
-                    # 2) Validate SQL
-                    validated_sql = validasi_sql(sql_generated) # validasi_sql raises ValueError on failure
+
+                    validated_sql = validasi_sql(sql_generated)
                     sql_generated = validated_sql
-                    break # If successful, exit retry loop
+                    break
                 except ValueError as e:
                     status_message.warning(f"Validasi SQL gagal (Percobaan {attempts+1}): {e}")
                     if attempts == 1:
-                        raise # Re-raise if second attempt fails
+                        raise
                     attempts += 1
                 except Exception as e:
                     status_message.error(f"Gagal generate SQL (Percobaan {attempts+1}): {e}")
                     if attempts == 1:
-                        raise # Re-raise if second attempt fails
+                        raise
                     attempts += 1
-            
+
             if not sql_generated:
                 raise Exception("Could not generate valid SQL after retries.")
 
@@ -263,19 +288,17 @@ if prompt := st.chat_input("Ada pertanyaan lain?"):
             st.code(sql_generated, language="sql")
             st.session_state.messages.append({"role": "assistant", "type": "sql", "content": sql_generated})
 
-            # 3) Run SQL
             status_message.info("Mengeksekusi SQL...")
             df_result = run_sql(sql_generated, st.session_state.db_engine)
             status_message.empty()
             st.dataframe(df_result)
             st.session_state.messages.append({"role": "assistant", "type": "df", "content": df_result})
 
-            # 4) Visualize
             plot_fig = visualize(df_result, prompt)
             if plot_fig:
                 st.pyplot(plot_fig)
                 st.session_state.messages.append({"role": "assistant", "type": "plot", "content": plot_fig})
-                plt.close(plot_fig) # Close the figure to free memory
+                plt.close(plot_fig)
             else:
                 st.info("Tidak ada visualisasi yang sesuai untuk data ini.")
 
