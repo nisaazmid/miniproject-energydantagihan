@@ -16,7 +16,7 @@ from sqlglot import exp
 # ============================================================
 
 st.set_page_config(
-    page_title="ASYIK",
+    page_title="ASYIK - Asisten Energi & Tagihan",
     page_icon="⚡",
     layout="wide",
 )
@@ -44,12 +44,11 @@ TEAL = "#0E8388"
 # Secrets
 # ============================================================
 
-def load_secrets() -> tuple[str, str, str]:
+def load_secrets() -> tuple[str, str]:
     """Ambil seluruh konfigurasi hanya dari Streamlit Secrets."""
     try:
         db_url = st.secrets["DB_URL"]
         google_api_key = st.secrets["GOOGLE_API_KEY"]
-        gemini_model = "gemini-3.1-flash-lite"
     except (KeyError, FileNotFoundError) as exc:
         st.error(
             "Secrets belum lengkap. Tambahkan DB_URL dan GOOGLE_API_KEY "
@@ -58,10 +57,11 @@ def load_secrets() -> tuple[str, str, str]:
         st.stop()
         raise RuntimeError("Streamlit secrets tidak lengkap") from exc
 
-    return str(db_url), str(google_api_key), str(gemini_model)
+    return str(db_url), str(google_api_key)
 
 
-DB_URL, GOOGLE_API_KEY, GEMINI_MODEL = load_secrets()
+DB_URL, GOOGLE_API_KEY = load_secrets()
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 
 # ============================================================
@@ -384,7 +384,7 @@ def figure_to_png(fig) -> bytes:
 # Chat rendering
 # ============================================================
 
-def render_message(message: dict) -> None:
+def render_message(message: dict, message_index: int) -> None:
     with st.chat_message(message["role"]):
         if message["role"] == "user":
             st.markdown(message["content"])
@@ -394,73 +394,137 @@ def render_message(message: dict) -> None:
             st.error(message["error"])
             return
 
-        if message.get("sql"):
-            st.markdown("**Generated SQL**")
-            st.code(message["sql"], language="sql")
-
         dataframe = message.get("dataframe")
         if isinstance(dataframe, pd.DataFrame):
-            st.dataframe(
-                dataframe,
-                use_container_width=True,
-                hide_index=True,
-            )
+            if dataframe.empty:
+                st.info("Data tidak ditemukan untuk pertanyaan tersebut.")
+            else:
+                st.caption(f"Ditemukan {len(dataframe)} baris hasil.")
+                st.dataframe(
+                    dataframe,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.download_button(
+                    label="Download CSV",
+                    data=dataframe.to_csv(index=False).encode("utf-8"),
+                    file_name="hasil_asyik.csv",
+                    mime="text/csv",
+                    key=f"download_{message_index}",
+                )
 
         chart_png = message.get("chart_png")
         if chart_png:
             st.image(chart_png, use_container_width=True)
-        elif message.get("show_no_chart"):
+        elif message.get("show_no_chart") and isinstance(dataframe, pd.DataFrame) and not dataframe.empty:
             st.info("Tidak ada visualisasi yang sesuai untuk hasil ini.")
+
+        if message.get("sql"):
+            with st.expander("Lihat query yang digunakan"):
+                st.code(message["sql"], language="sql")
 
 
 # ============================================================
 # Streamlit interface
 # ============================================================
 
-st.title("⚡ ASYIK - Asisten Yang Kamu Inginkan")
+st.title("⚡ ASYIK — Asisten Energi & Tagihan")
+st.caption("Asisten internal PLN untuk membantu mencari informasi konsumsi energi, tagihan pelanggan, dan status pembayaran berdasarkan data yang tersedia.")
+
+EXAMPLE_QUESTIONS = [
+    "Berapa total konsumsi kWh per wilayah pada bulan Januari 2026?",
+    "Siapa 10 pelanggan dengan total tunggakan tertinggi?",
+    "Bagaimana tren total tagihan selama 6 bulan terakhir?",
+]
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-for saved_message in st.session_state.messages:
-    render_message(saved_message)
+with st.sidebar:
+    st.subheader("Tentang ASYIK")
+    st.write(
+        "Gunakan ASYIK untuk bertanya tentang konsumsi kWh, tagihan, "
+        "tunggakan, status pembayaran, wilayah, pelanggan, dan periode waktu."
+    )
+    st.caption(
+        "ASYIK hanya menjawab berdasarkan data pada database energi dan tagihan yang tersedia."
+    )
 
-if user_question := st.chat_input("Ada pertanyaan lain?"):
+    if st.button("Hapus percakapan", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+st.info(
+    "Saya membantu pengguna internal PLN menganalisis konsumsi energi, "
+    "tagihan pelanggan, tunggakan, status pembayaran, wilayah, dan periode waktu."
+)
+
+st.markdown("**Contoh pertanyaan:**")
+selected_example = None
+columns = st.columns(3)
+for index, question in enumerate(EXAMPLE_QUESTIONS):
+    if columns[index].button(
+        question,
+        key=f"example_{index}",
+        use_container_width=True,
+    ):
+        selected_example = question
+
+for message_index, saved_message in enumerate(st.session_state.messages):
+    render_message(saved_message, message_index)
+
+typed_question = st.chat_input("Tanyakan tentang energi dan tagihan...")
+user_question = selected_example or typed_question
+
+if user_question:
     user_message = {
         "role": "user",
         "content": user_question,
     }
     st.session_state.messages.append(user_message)
-    render_message(user_message)
+    render_message(user_message, len(st.session_state.messages) - 1)
 
     with st.chat_message("assistant"):
         try:
-            with st.spinner("Menganalisis pertanyaan..."):
+            with st.spinner("Mengambil dan menyiapkan data..."):
                 generated_sql = generate_sql(user_question)
                 validated_sql = validate_sql(generated_sql)
-
-                st.markdown("**Generated SQL**")
-                st.code(validated_sql, language="sql")
-
                 dataframe = run_sql(validated_sql)
-                st.dataframe(
-                    dataframe,
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
-                fig = create_visualization(
-                    dataframe=dataframe,
-                    question=user_question,
-                )
-
-                chart_png = None
-                if fig is not None:
-                    st.pyplot(fig, use_container_width=True)
-                    chart_png = figure_to_png(fig)
-                    plt.close(fig)
+                if dataframe.empty:
+                    st.info("Data tidak ditemukan untuk pertanyaan tersebut.")
+                    fig = None
+                    chart_png = None
                 else:
-                    st.info("Tidak ada visualisasi yang sesuai untuk hasil ini.")
+                    st.caption(f"Ditemukan {len(dataframe)} baris hasil.")
+                    st.dataframe(
+                        dataframe,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.download_button(
+                        label="Download CSV",
+                        data=dataframe.to_csv(index=False).encode("utf-8"),
+                        file_name="hasil_asyik.csv",
+                        mime="text/csv",
+                        key=f"download_current_{len(st.session_state.messages)}",
+                    )
+
+                    fig = create_visualization(
+                        dataframe=dataframe,
+                        question=user_question,
+                    )
+
+                    chart_png = None
+                    if fig is not None:
+                        st.pyplot(fig, use_container_width=True)
+                        chart_png = figure_to_png(fig)
+                        plt.close(fig)
+                    else:
+                        st.info("Tidak ada visualisasi yang sesuai untuk hasil ini.")
+
+                with st.expander("Lihat query yang digunakan"):
+                    st.code(validated_sql, language="sql")
 
                 assistant_message = {
                     "role": "assistant",
@@ -472,10 +536,12 @@ if user_question := st.chat_input("Ada pertanyaan lain?"):
 
         except Exception as exc:
             error_message = (
-                f"Terjadi kesalahan: {exc}\n\n"
-                "Periksa pertanyaan, konfigurasi Secrets, dan koneksi database."
+                "Pertanyaan belum dapat diproses. Coba sertakan periode, wilayah, "
+                "nama pelanggan, atau jenis informasi yang ingin dilihat."
             )
             st.error(error_message)
+            with st.expander("Detail teknis"):
+                st.code(str(exc))
             assistant_message = {
                 "role": "assistant",
                 "error": error_message,
