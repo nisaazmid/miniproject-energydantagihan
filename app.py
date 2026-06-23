@@ -49,7 +49,7 @@ def load_secrets() -> tuple[str, str, str]:
     try:
         db_url = st.secrets["DB_URL"]
         google_api_key = st.secrets["GOOGLE_API_KEY"]
-        gemini_model = st.secrets.get("GEMINI_MODEL", "gemini-3.5-flash")
+        gemini_model = st.secrets.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
     except (KeyError, FileNotFoundError) as exc:
         st.error(
             "Secrets belum lengkap. Tambahkan DB_URL dan GOOGLE_API_KEY "
