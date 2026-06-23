@@ -26,14 +26,14 @@ customers(cust_id, nama, tarif, wilayah)
 usage(cust_id, bulan, kwh, tagihan, status_bayar)
 
 Relasi:
-- usage.cust_id -> costumers.cust_id
+- usage.cust_id -> customers.cust_id
 
 Catatan:
 - bulan berformat YYYY-MM, misalnya 2026-01
 - status_bayar berisi lunas atau tertunggak
 """.strip()
 
-ALLOWED_TABLES = {"costumers", "usage"}
+ALLOWED_TABLES = {"customers", "usage"}
 DEFAULT_LIMIT = 200
 MAX_LIMIT = 1000
 QUERY_TIMEOUT_MS = 8_000
