@@ -1,307 +1,484 @@
-import streamlit as st
-import os, re, glob, zipfile
-import pandas as pd
-import matplotlib.pyplot as plt
-from sqlalchemy import create_engine, text
-import gdown # Used for downloading data if not present
-import google.generativeai as genai
-import json # Used in generate_sql, although current notebook implementation uses resp.text
+import io
+import re
 
-# === Global Constants from Notebook ===
-SCHEMA_STR = """customers(cust_id, nama, tarif, wilayah)
+import matplotlib.pyplot as plt
+import pandas as pd
+import sqlglot
+import streamlit as st
+from google import genai
+from google.genai import types
+from sqlalchemy import create_engine, text
+from sqlglot import exp
+
+
+# ============================================================
+# Konfigurasi aplikasi
+# ============================================================
+
+st.set_page_config(
+    page_title="ASYIK",
+    page_icon="⚡",
+    layout="wide",
+)
+
+SCHEMA_STR = """
+costumers(cust_id, nama, tarif, wilayah)
 usage(cust_id, bulan, kwh, tagihan, status_bayar)
 
 Relasi:
-- usage.cust_id -> customers.cust_id
-Catatan: kolom 'bulan' berformat 'YYYY-MM' (mis. '2026-01').
-         status_bayar berisi 'lunas' atau 'tertunggak'."""
+- usage.cust_id -> costumers.cust_id
 
-DIALEK = 'PostgreSQL'
-TERLARANG = ('drop','delete','update','insert','alter','truncate','create','replace',
-             'grant','revoke','merge','into','attach','detach','pragma','vacuum','copy','dblink')
-POLA_BAHAYA = (r'\binformation_schema\b', r'\bpg_catalog\b', r'\bpg_\w+\b',
-               r'\bsqlite_master\b', r'\bload_extension\b', r'\blo_import\b', r'\blo_export\b')
-_FUNGSI_FROM = r'\b(?:extract|substring|trim|position|overlay)\s*\([^)]*\)'
-TABEL_OK = {'customers','usage'}
-TEAL = '#0E8388'
+Catatan:
+- bulan berformat YYYY-MM, misalnya 2026-01
+- status_bayar berisi lunas atau tertunggak
+""".strip()
 
-# --- LLM Setup Configuration ---
-# In Streamlit, it's best practice to get API keys from st.secrets or environment variables.
-PROVIDER = 'mock' # Default to mock if no API key is found
-GEMINI_MODEL = 'gemini-1.5-flash' # Using the original model name from notebook's TODO 1
+ALLOWED_TABLES = {"costumers", "usage"}
+DEFAULT_LIMIT = 200
+MAX_LIMIT = 1000
+QUERY_TIMEOUT_MS = 8_000
+TEAL = "#0E8388"
 
-# Try to get GOOGLE_API_KEY from st.secrets first for Streamlit Cloud deployment
-if st.secrets.get('GOOGLE_API_KEY'):
-    PROVIDER = 'gemini'
 
-USE_MOCK = (PROVIDER == 'mock')
+# ============================================================
+# Secrets
+# ============================================================
 
-# --- Functions (adapted from notebook) ---
+def load_secrets() -> tuple[str, str, str]:
+    """Ambil seluruh konfigurasi hanya dari Streamlit Secrets."""
+    try:
+        db_url = st.secrets["DB_URL"]
+        google_api_key = st.secrets["GOOGLE_API_KEY"]
+        gemini_model = st.secrets.get("GEMINI_MODEL", "gemini-3.5-flash")
+    except (KeyError, FileNotFoundError) as exc:
+        st.error(
+            "Secrets belum lengkap. Tambahkan DB_URL dan GOOGLE_API_KEY "
+            "pada Streamlit App Settings → Secrets."
+        )
+        st.stop()
+        raise RuntimeError("Streamlit secrets tidak lengkap") from exc
+
+    return str(db_url), str(google_api_key), str(gemini_model)
+
+
+DB_URL, GOOGLE_API_KEY, GEMINI_MODEL = load_secrets()
+
+
+# ============================================================
+# Resource initialization
+# ============================================================
 
 @st.cache_resource
-def setup_database(db_url):
-    """
-    Sets up the PostgreSQL engine and loads data. This function is cached
-    to avoid re-running on every Streamlit rerun.
-    """
-    st.info("Initializing database connection and loading data...")
-    try:
-        engine = create_engine(db_url)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1")) # Test connection
-            st.success(f"PostgreSQL connected to {db_url.split('@')[-1]}")
+def get_database_engine(db_url: str):
+    """Buat koneksi SQLAlchemy ke PostgreSQL Supabase."""
+    engine = create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        connect_args={"sslmode": "require"},
+    )
 
-        CSV_FILES = ['customers.csv', 'usage.csv']
-        data_dir = "data"
-        os.makedirs(data_dir, exist_ok=True)
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
 
-        # Assuming the ZIP download was already handled in the Colab setup
-        # If running this Streamlit app independently, you might need to
-        # re-implement the gdown logic or ensure files are pre-staged.
-        # For this example, we assume data/customers.csv and data/usage.csv exist.
-        
-        # Check if files exist, if not, attempt to download with default IDs
-        # These default IDs are from the initial notebook setup for Use Case B
-        if not os.path.exists(os.path.join(data_dir, "dataset.zip")):
-            DRIVE_ZIP_URL = "https://drive.google.com/uc?id=1KozrOgW1ChAKK2zHM1o-r_BPt08-zKR2"
-            try:
-                gdown.download(DRIVE_ZIP_URL, os.path.join(data_dir, "dataset.zip"), quiet=True)
-                with zipfile.ZipFile(os.path.join(data_dir, "dataset.zip")) as z:
-                    z.extractall(data_dir)
-                st.info("Dataset ZIP downloaded and extracted.")
-            except Exception as dl_e:
-                st.warning(f"Could not download dataset ZIP: {dl_e}. Assuming CSVs exist or will be manually placed.")
+    return engine
 
-        for fn in CSV_FILES:
-            table = fn[:-4]
-            filepath = os.path.join(data_dir, fn)
 
-            if not os.path.exists(filepath):
-                 st.error(f"File {filepath} not found. Please ensure data files are available in the 'data' directory.")
-                 continue # Skip this table if file not found
+@st.cache_resource
+def get_gemini_client(api_key: str):
+    """Buat Gemini client satu kali untuk seluruh sesi aplikasi."""
+    return genai.Client(api_key=api_key)
 
-            df = pd.read_csv(filepath)
-            df.to_sql(table, engine, if_exists="replace", index=False)
-            st.success(f"Tabel '{table}' dimuat: {df.shape[0]} baris, {df.shape[1]} kolom")
 
-        return engine
-    except Exception as e:
-        st.error(f"Failed to setup database: {e}. Please ensure PostgreSQL is running and accessible and DB_URL is correct.")
-        return None
+try:
+    db_engine = get_database_engine(DB_URL)
+except Exception as exc:
+    st.error(f"Gagal terhubung ke database Supabase: {exc}")
+    st.stop()
+
+gemini_client = get_gemini_client(GOOGLE_API_KEY)
+
+
+# ============================================================
+# SQL generation and validation
+# ============================================================
 
 def build_prompt(question: str) -> str:
-    prompt = f"""Anda ahli SQL {DIALEK}
-              skema db: {SCHEMA_STR}
-              Buat SATU query SELECT (JOIN bila perlu). Balas HANYA query SQL.
-              Pertanyaan: {question}
-              """
-    return prompt
+    return f"""
+Anda adalah pembuat query PostgreSQL.
 
-def generate_sql(resp):
-    # This function expects a string (resp.text from LLM) or a dict (for mock)
-    if isinstance(resp, dict): # For mock responses that might pass a dict
-        resp = resp.get('sql', json.dumps(resp))
-    teks = str(resp).strip()
-    m = re.search(r'```(?:sql)?\s*(.+?)```', teks, re.S)
-    if m: teks = m.group(1).strip()
-    m = re.search(r'(select\b.+)', teks, re.I | re.S)
-    if m: teks = m.group(1)
-    return teks.rstrip(';').strip()
+Skema database:
+{SCHEMA_STR}
 
-def _strip_komentar(sql):
-    sql = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.S)
-    return re.sub(r'--[^\n]*', ' ', sql)
+Aturan:
+1. Buat tepat satu query read-only.
+2. Query utama harus berupa SELECT; WITH/CTE boleh digunakan bila diperlukan.
+3. Hanya gunakan tabel costumers dan usage.
+4. Gunakan JOIN berdasarkan relasi yang tersedia.
+5. Jangan gunakan markdown, penjelasan, atau code fence.
+6. Balas hanya dengan query SQL.
 
-def validasi_sql(sql, batas=200, batas_maks=1000):
-    t = _strip_komentar(sql).strip().rstrip(';').strip(); low = t.lower()
-    if not (low.startswith('select') or low.startswith('with')): raise ValueError('Hanya SELECT/WITH')
-    if ';' in t: raise ValueError('Multi-statement')
-    for k in TERLARANG:
-        if re.search(rf'\b{k}\b', low): raise ValueError(f'Terlarang: {k}')
-    for pola in POLA_BAHAYA:
-        m = re.search(pola, low)
-        if m: raise ValueError(f'Objek terlarang: {m.group()}')
-    low_tab = re.sub(_FUNGSI_FROM, ' ', low)
-    asing = set(re.findall(r'(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)', low_tab)) - TABEL_OK
-    if asing: raise ValueError(f'Tabel tak dikenal: {asing}')
-    m = re.search(r'\blimit\s+(\d+)', low)
-    if m:
-        if int(m.group(1)) > batas_maks: t = re.sub(r'\blimit\s+\d+', f'LIMIT {batas_maks}', t, flags=re.I)
-    else:
-        t += f' LIMIT {batas}'
-    return t
+Pertanyaan pengguna:
+{question}
+""".strip()
 
-def run_sql(sql: str, engine_obj) -> pd.DataFrame:
-    with engine_obj.connect() as conn:
-        return pd.read_sql(text(sql), conn)
 
-def visualize(df, pertanyaan='', jenis=None):
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return None # No data to visualize
+def extract_sql(response_text: str) -> str:
+    """Ambil SQL dari respons model dan buang code fence bila masih muncul."""
+    if not response_text or not response_text.strip():
+        raise ValueError("Gemini tidak mengembalikan query SQL.")
 
-    # Determine chart type based on columns and question
-    if len(df.columns) < 2:
-        return None # Need at least 2 columns for meaningful chart
+    sql = response_text.strip()
 
-    x_col = df.columns[0]
-    y_col = df.columns[-1]
+    fenced_match = re.search(
+        r"```(?:sql)?\s*(.*?)```",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced_match:
+        sql = fenced_match.group(1).strip()
 
-    # Try to infer type if not explicitly given
-    if jenis is None:
-        p = pertanyaan.lower()
-        x_col_lower = str(x_col).lower()
+    query_match = re.search(
+        r"\b(?:WITH|SELECT)\b.*",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not query_match:
+        raise ValueError("Respons Gemini tidak mengandung query SELECT/WITH.")
 
-        if 'pie' in p or 'komposisi' in p or 'proporsi' in p:
-            jenis = 'pie'
-        elif 'periode' in x_col_lower or 'bulan' in p or 'tren' in p:
-            jenis = 'line'
-        else:
-            jenis = 'bar'
+    return query_match.group(0).strip().rstrip(";").strip()
 
-    fig, ax = plt.subplots(figsize=(7, 4))
-    try:
-        if jenis == 'line':
-            ax.plot(df[x_col].astype(str), df[y_col], marker='o', color=TEAL)
-            ax.set_ylabel(str(y_col))
-            plt.xticks(rotation=30, ha='right')
-        elif jenis == 'pie':
-            if df[y_col].sum() == 0:
-                return None # Avoid division by zero
-            ax.pie(df[y_col], labels=df[x_col].astype(str), autopct='%1.0f%%',
-                   colors=plt.cm.Greens([0.4,0.55,0.7,0.85,0.6,0.45]))
-        else: # Default to bar chart
-            ax.bar(df[x_col].astype(str), df[y_col], color=TEAL)
-            ax.set_ylabel(str(y_col))
-            plt.xticks(rotation=30, ha='right')
-        ax.set_title(pertanyaan or f'{y_col} per {x_col}')
-        plt.tight_layout()
-        return fig
-    except Exception as e:
-        st.warning(f"Could not generate visualization: {e}")
-        plt.close(fig) # Close figure if an error occurs to prevent memory leak
+
+def generate_sql(question: str) -> str:
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=build_prompt(question),
+        config=types.GenerateContentConfig(
+            temperature=0,
+        ),
+    )
+    return extract_sql(response.text or "")
+
+
+def _get_limit_value(limit_expression: exp.Limit | None) -> int | None:
+    if limit_expression is None:
         return None
 
-# --- Streamlit App ---
-st.set_page_config(layout="wide")
-st.title("⚡️ ASYIK - Asisten Yang kamu Inginkan")
+    value_expression = limit_expression.expression
+    if not isinstance(value_expression, exp.Literal):
+        return None
 
-# Initialize chat history
+    try:
+        return int(value_expression.this)
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_sql(
+    sql: str,
+    default_limit: int = DEFAULT_LIMIT,
+    max_limit: int = MAX_LIMIT,
+) -> str:
+    """
+    Parse SQL sebagai PostgreSQL, pastikan hanya query SELECT,
+    batasi tabel, dan pasang batas jumlah baris.
+    """
+    try:
+        statements = sqlglot.parse(sql, read="postgres")
+    except sqlglot.errors.ParseError as exc:
+        raise ValueError(f"SQL tidak valid: {exc}") from exc
+
+    if len(statements) != 1:
+        raise ValueError("Hanya satu statement SQL yang diperbolehkan.")
+
+    query = statements[0]
+
+    # WITH ... SELECT tetap diparse sebagai Select.
+    if not isinstance(query, exp.Select):
+        raise ValueError("Hanya query SELECT/WITH yang diperbolehkan.")
+
+    forbidden_types = (
+        exp.Insert,
+        exp.Update,
+        exp.Delete,
+        exp.Create,
+        exp.Drop,
+        exp.Alter,
+        exp.Command,
+        exp.Copy,
+        exp.Merge,
+        exp.TruncateTable,
+    )
+
+    if any(isinstance(node, forbidden_types) for node in query.walk()):
+        raise ValueError("Query mengandung operasi yang tidak diperbolehkan.")
+
+    cte_names = {
+        cte.alias_or_name.lower()
+        for cte in query.find_all(exp.CTE)
+        if cte.alias_or_name
+    }
+
+    referenced_tables = {
+        table.name.lower()
+        for table in query.find_all(exp.Table)
+        if table.name and table.name.lower() not in cte_names
+    }
+
+    unknown_tables = referenced_tables - ALLOWED_TABLES
+    if unknown_tables:
+        raise ValueError(
+            "Tabel tidak diperbolehkan: "
+            + ", ".join(sorted(unknown_tables))
+        )
+
+    current_limit = _get_limit_value(query.args.get("limit"))
+
+    if current_limit is None:
+        query = query.limit(default_limit, copy=False)
+    elif current_limit > max_limit:
+        query = query.limit(max_limit, copy=False)
+
+    return query.sql(dialect="postgres")
+
+
+def run_sql(sql: str) -> pd.DataFrame:
+    """
+    Jalankan query dalam transaksi read-only dengan statement timeout.
+    """
+    with db_engine.connect() as connection:
+        transaction = connection.begin()
+
+        try:
+            connection.execute(text("SET TRANSACTION READ ONLY"))
+            connection.execute(
+                text(f"SET LOCAL statement_timeout = '{QUERY_TIMEOUT_MS}ms'")
+            )
+            result = pd.read_sql_query(text(sql), connection)
+            transaction.commit()
+            return result
+        except Exception:
+            transaction.rollback()
+            raise
+
+
+# ============================================================
+# Visualization
+# ============================================================
+
+def choose_chart_type(
+    dataframe: pd.DataFrame,
+    question: str,
+    x_column: str,
+) -> str:
+    question_lower = question.lower()
+    x_lower = x_column.lower()
+
+    if any(keyword in question_lower for keyword in ("pie", "komposisi", "proporsi")):
+        return "pie"
+
+    time_keywords = ("bulan", "tanggal", "periode", "tahun", "date", "month", "year")
+    if any(keyword in x_lower for keyword in time_keywords):
+        return "line"
+
+    if any(keyword in question_lower for keyword in ("tren", "trend")):
+        return "line"
+
+    return "bar"
+
+
+def create_visualization(
+    dataframe: pd.DataFrame,
+    question: str,
+):
+    if dataframe.empty or len(dataframe.columns) < 2:
+        return None
+
+    numeric_columns = list(
+        dataframe.select_dtypes(include="number").columns
+    )
+    if not numeric_columns:
+        return None
+
+    y_column = numeric_columns[-1]
+    x_candidates = [
+        column for column in dataframe.columns if column != y_column
+    ]
+    if not x_candidates:
+        return None
+
+    x_column = x_candidates[0]
+    chart_type = choose_chart_type(
+        dataframe=dataframe,
+        question=question,
+        x_column=str(x_column),
+    )
+
+    chart_data = dataframe[[x_column, y_column]].dropna().copy()
+    if chart_data.empty:
+        return None
+
+    if chart_type == "line":
+        chart_data = chart_data.sort_values(by=x_column)
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    try:
+        if chart_type == "line":
+            ax.plot(
+                chart_data[x_column].astype(str),
+                chart_data[y_column],
+                marker="o",
+                color=TEAL,
+            )
+            ax.set_ylabel(str(y_column))
+            ax.tick_params(axis="x", rotation=30)
+
+        elif chart_type == "pie":
+            values = pd.to_numeric(
+                chart_data[y_column],
+                errors="coerce",
+            ).fillna(0)
+
+            if values.sum() <= 0:
+                plt.close(fig)
+                return None
+
+            ax.pie(
+                values,
+                labels=chart_data[x_column].astype(str),
+                autopct="%1.0f%%",
+            )
+
+        else:
+            ax.bar(
+                chart_data[x_column].astype(str),
+                chart_data[y_column],
+                color=TEAL,
+            )
+            ax.set_ylabel(str(y_column))
+            ax.tick_params(axis="x", rotation=30)
+
+        ax.set_title(question or f"{y_column} per {x_column}")
+        fig.tight_layout()
+        return fig
+
+    except Exception:
+        plt.close(fig)
+        raise
+
+
+def figure_to_png(fig) -> bytes:
+    buffer = io.BytesIO()
+    fig.savefig(
+        buffer,
+        format="png",
+        dpi=150,
+        bbox_inches="tight",
+    )
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ============================================================
+# Chat rendering
+# ============================================================
+
+def render_message(message: dict) -> None:
+    with st.chat_message(message["role"]):
+        if message["role"] == "user":
+            st.markdown(message["content"])
+            return
+
+        if message.get("error"):
+            st.error(message["error"])
+            return
+
+        if message.get("sql"):
+            st.markdown("**Generated SQL**")
+            st.code(message["sql"], language="sql")
+
+        dataframe = message.get("dataframe")
+        if isinstance(dataframe, pd.DataFrame):
+            st.dataframe(
+                dataframe,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        chart_png = message.get("chart_png")
+        if chart_png:
+            st.image(chart_png, use_container_width=True)
+        elif message.get("show_no_chart"):
+            st.info("Tidak ada visualisasi yang sesuai untuk hasil ini.")
+
+
+# ============================================================
+# Streamlit interface
+# ============================================================
+
+st.title("⚡ ASYIK - Asisten Yang Kamu Inginkan")
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Get DB_URL from st.secrets
-DB_URL = st.secrets.get('DB_URL', 'postgresql://postgres:postgres@localhost:5432/miniproject')
-if not DB_URL:
-    st.error("DB_URL not found in Streamlit secrets or environment variables. Please provide your PostgreSQL connection string.")
-    st.stop()
+for saved_message in st.session_state.messages:
+    render_message(saved_message)
 
-# Setup database (cached function)
-if "db_engine" not in st.session_state:
-    st.session_state.db_engine = setup_database(DB_URL)
-    if st.session_state.db_engine is None:
-        st.error("Database setup failed. Please check the console for errors and ensure DB_URL is correct.")
-        st.stop() # Stop the app if DB setup fails
-
-# Initialize LLM model
-if "llm_model" not in st.session_state:
-    if USE_MOCK:
-        st.session_state.llm_model = "mock" # Simple string for mock model
-    elif PROVIDER == 'gemini':
-        gemini_api_key = st.secrets.get('GOOGLE_API_KEY')
-        if not gemini_api_key:
-            st.error("Google API Key (GOOGLE_API_KEY) not found in Streamlit secrets or environment variables. Please set it.")
-            st.stop()
-        try:
-            genai.configure(api_key=gemini_api_key)
-            st.session_state.llm_model = genai.GenerativeModel(GEMINI_MODEL)
-        except Exception as e:
-            st.error(f"Failed to initialize Gemini model: {e}")
-            st.stop()
-    else:
-        st.error(f"LLM provider '{PROVIDER}' not supported or API key missing.")
-        st.stop()
-llm_model = st.session_state.llm_model
-
-# Display chat messages from history on app rerun
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        if message["type"] == "text":
-            st.markdown(message["content"])
-        elif message["type"] == "df":
-            st.dataframe(message["content"])
-        elif message["type"] == "sql":
-            st.markdown("**Generated SQL:**")
-            st.code(message["content"], language="sql")
-        elif message["type"] == "plot":
-            st.pyplot(message["content"])
-            plt.close(message["content"]) # Close the figure to free memory
-
-# React to user input
-if prompt := st.chat_input("Ada pertanyaan lain?"):
-    st.chat_message("user").markdown(prompt)
-    st.session_state.messages.append({"role": "user", "type": "text", "content": prompt})
+if user_question := st.chat_input("Ada pertanyaan lain?"):
+    user_message = {
+        "role": "user",
+        "content": user_question,
+    }
+    st.session_state.messages.append(user_message)
+    render_message(user_message)
 
     with st.chat_message("assistant"):
-        status_message = st.empty()
-        status_message.info("Menganalisis pertanyaan...")
-
-        sql_generated = ""
-        df_result = pd.DataFrame()
-        plot_fig = None
-
         try:
-            attempts = 0
-            while attempts < 2:
-                try:
-                    llm_prompt = build_prompt(prompt)
-                    if USE_MOCK:
-                        if "total konsumsi kWh per wilayah pada bulan Januari (2026-01)" in prompt:
-                            sql_generated = "SELECT c.wilayah, SUM(u.kwh) AS total_kwh FROM customers c JOIN usage u ON c.cust_id = u.cust_id WHERE u.bulan = '2026-01' GROUP BY c.wilayah ORDER BY total_kwh DESC"
-                        elif "10 pelanggan dengan total tunggakan tertinggi" in prompt:
-                            sql_generated = "SELECT c.nama, SUM(u.tagihan) AS total_tunggakan FROM customers c JOIN usage u ON c.cust_id = u.cust_id WHERE u.status_bayar = 'tertunggak' GROUP BY c.nama ORDER BY total_tunggakan DESC LIMIT 10"
-                        elif "tren total tagihan selama 6 bulan terakhir" in prompt:
-                            sql_generated = "SELECT bulan, SUM(tagihan) AS total_tagihan FROM usage GROUP BY bulan ORDER BY bulan DESC LIMIT 6"
-                        else:
-                            sql_generated = f"SELECT 'Mock SQL result for: {prompt}' AS result;"
-                    else:
-                        resp = llm_model.generate_content(llm_prompt)
-                        sql_generated = generate_sql(resp.text)
+            with st.spinner("Menganalisis pertanyaan..."):
+                generated_sql = generate_sql(user_question)
+                validated_sql = validate_sql(generated_sql)
 
-                    validated_sql = validasi_sql(sql_generated)
-                    sql_generated = validated_sql
-                    break
-                except ValueError as e:
-                    status_message.warning(f"Validasi SQL gagal (Percobaan {attempts+1}): {e}")
-                    if attempts == 1:
-                        raise
-                    attempts += 1
-                except Exception as e:
-                    status_message.error(f"Gagal generate SQL (Percobaan {attempts+1}): {e}")
-                    if attempts == 1:
-                        raise
-                    attempts += 1
+                st.markdown("**Generated SQL**")
+                st.code(validated_sql, language="sql")
 
-            if not sql_generated:
-                raise Exception("Could not generate valid SQL after retries.")
+                dataframe = run_sql(validated_sql)
+                st.dataframe(
+                    dataframe,
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-            status_message.info("SQL yang dihasilkan:")
-            st.code(sql_generated, language="sql")
-            st.session_state.messages.append({"role": "assistant", "type": "sql", "content": sql_generated})
+                fig = create_visualization(
+                    dataframe=dataframe,
+                    question=user_question,
+                )
 
-            status_message.info("Mengeksekusi SQL...")
-            df_result = run_sql(sql_generated, st.session_state.db_engine)
-            status_message.empty()
-            st.dataframe(df_result)
-            st.session_state.messages.append({"role": "assistant", "type": "df", "content": df_result})
+                chart_png = None
+                if fig is not None:
+                    st.pyplot(fig, use_container_width=True)
+                    chart_png = figure_to_png(fig)
+                    plt.close(fig)
+                else:
+                    st.info("Tidak ada visualisasi yang sesuai untuk hasil ini.")
 
-            plot_fig = visualize(df_result, prompt)
-            if plot_fig:
-                st.pyplot(plot_fig)
-                st.session_state.messages.append({"role": "assistant", "type": "plot", "content": plot_fig})
-                plt.close(plot_fig)
-            else:
-                st.info("Tidak ada visualisasi yang sesuai untuk data ini.")
+                assistant_message = {
+                    "role": "assistant",
+                    "sql": validated_sql,
+                    "dataframe": dataframe,
+                    "chart_png": chart_png,
+                    "show_no_chart": fig is None,
+                }
 
-        except Exception as e:
-            status_message.error(f"⚠️ Terjadi kesalahan: {e}\nSilakan periksa kembali pertanyaan atau konfigurasi.")
-            st.session_state.messages.append({"role": "assistant", "type": "text", "content": f"⚠️ Terjadi kesalahan: {e}\nSilakan periksa kembali pertanyaan atau konfigurasi."})
+        except Exception as exc:
+            error_message = (
+                f"Terjadi kesalahan: {exc}\n\n"
+                "Periksa pertanyaan, konfigurasi Secrets, dan koneksi database."
+            )
+            st.error(error_message)
+            assistant_message = {
+                "role": "assistant",
+                "error": error_message,
+            }
+
+    st.session_state.messages.append(assistant_message)
