@@ -22,7 +22,7 @@ st.set_page_config(
 )
 
 SCHEMA_STR = """
-costumers(cust_id, nama, tarif, wilayah)
+customers(cust_id, nama, tarif, wilayah)
 usage(cust_id, bulan, kwh, tagihan, status_bayar)
 
 Relasi:
