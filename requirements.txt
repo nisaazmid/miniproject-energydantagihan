@@ -1,7 +1,7 @@
 streamlit
-google-generativeai
 pandas
 matplotlib
-sqlalchemy
+SQLAlchemy
 psycopg2-binary
-gdown
+google-genai
+sqlglot
